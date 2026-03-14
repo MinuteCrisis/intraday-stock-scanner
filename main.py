@@ -6,6 +6,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ import schedule
 import yfinance as yf
 from flask import Flask
 from flask import Response
+from flask import jsonify
 from flask import request
 
 
@@ -26,11 +28,14 @@ CONFIG_PATH = PROJECT_DIR / "config.json"
 STOCK_LIST_PATH = PROJECT_DIR / "stocks_nse.csv"
 LOG_DIR = PROJECT_DIR / "logs"
 LOG_PATH = LOG_DIR / "scanner.log"
+STRONG_LOG_PATH = LOG_DIR / "strong_signals.log"
 
 RUPEE = "\N{INDIAN RUPEE SIGN}"
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = dt_time(hour=9, minute=15)
 MARKET_CLOSE = dt_time(hour=15, minute=30)
+ALERT_START = dt_time(hour=9, minute=20)
+ALERT_END = dt_time(hour=14, minute=45)
 INDEX_SYMBOLS = {
     "NIFTY": "^NSEI",
     "BANKNIFTY": "^NSEBANK",
@@ -43,6 +48,20 @@ ALERT_SIGNAL_SCORES = {
     "Opening Range Breakdown": 2,
     "price drop": 1,
     "market bearish": 1,
+}
+SIGNAL_CATEGORIES = {
+    "VWAP breakdown": "price_structure",
+    "VWAP rejection": "price_structure",
+    "Opening Range Breakdown": "price_structure",
+    "Opening Range Breakout": "price_structure",
+    "support break": "price_structure",
+    "volume spike": "volume",
+    "relative volume": "volume",
+    "RSI overbought": "momentum",
+    "RSI oversold": "momentum",
+    "market bearish": "market",
+    "gap up": "market",
+    "gap down": "market",
 }
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,6 +77,7 @@ logger = logging.getLogger("intraday_scanner")
 
 app = Flask(__name__)
 scanner_thread: threading.Thread | None = None
+scanner_instance: "IntradayStockScanner | None" = None
 scanner_lock = threading.Lock()
 
 
@@ -79,7 +99,13 @@ class ScannerConfig:
     top_losers_count: int
     top_gainers_count: int
     market_bearish_threshold_percent: float
+    gap_threshold_percent: float
+    min_average_daily_volume: int
+    atr_period: int
+    min_atr_percent: float
+    max_ranked_alerts: int
     repeat_alert_after_minutes: int
+    force_market_open: bool
     stock_mode: str
     custom_watchlist: List[str]
     telegram_enabled: bool
@@ -92,10 +118,26 @@ class IntradayStockScanner:
         self.config = config
         self.symbols = symbols
         self.alert_cache: Dict[Tuple[str, str], datetime] = {}
+        self.pending_signals: Dict[Tuple[str, str], int] = {}
+        self.daily_watchlist: List[str] = []
+        self.daily_watchlist_date: datetime.date | None = None
+        self.daily_symbol_alert_count: Dict[Tuple[str, datetime.date], int] = {}
+        self.daily_counters_date: datetime.date | None = None
+        self.total_alerts_generated = 0
+        self.strong_alerts_count = 0
+        self.unique_symbols_alerted: set[str] = set()
+        self.daily_summary_sent_date: datetime.date | None = None
+        self.recent_alerts: deque[Dict[str, object]] = deque(maxlen=100)
+        self.last_scan_time: str | None = None
 
     def run_once(self) -> None:
-        timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-        if not is_market_open():
+        started_at = time.perf_counter()
+        now = datetime.now(IST)
+        self._reset_daily_state_if_needed(now)
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+        self.last_scan_time = now.isoformat()
+        if not is_market_open(self.config.force_market_open):
+            self._send_daily_summary_if_needed(now)
             logger.info("NSE market closed. Skipping scan.")
             print(f"\n[{timestamp}] NSE market closed. Skipping scan.")
             return
@@ -109,8 +151,17 @@ class IntradayStockScanner:
             logger.error("No intraday data returned from Yahoo Finance.")
             print("No intraday data returned from Yahoo Finance.")
             return
+        if len(intraday_data) < max(1, math.ceil(len(self.symbols) * 0.5)):
+            logger.warning("Data coverage too low, skipping scan.")
+            print("Data coverage too low, skipping scan.")
+            return
 
-        previous_day_lows = self._download_previous_day_lows(scan_cache, list(intraday_data.keys()))
+        daily_metrics = self._download_daily_metrics(scan_cache, list(intraday_data.keys()))
+        self._update_daily_watchlist(intraday_data, daily_metrics)
+        symbols_to_scan = self._symbols_for_current_cycle(intraday_data.keys())
+        if symbols_to_scan != list(intraday_data.keys()):
+            intraday_data = {symbol: intraday_data[symbol] for symbol in symbols_to_scan if symbol in intraday_data}
+            daily_metrics = {symbol: daily_metrics[symbol] for symbol in symbols_to_scan if symbol in daily_metrics}
         index_snapshot = self._download_market_indexes(scan_cache)
         market_bearish = index_snapshot["market_bearish"]
         market_trend = index_snapshot["market_trend"]
@@ -121,8 +172,14 @@ class IntradayStockScanner:
             index_snapshot["BANKNIFTY"]["change_percent"],
         )
 
+        if not self.config.force_market_open and not is_alert_window():
+            logger.info("Outside alert window. Skipping alert generation.")
+            print("Outside alert window. Skipping alert generation.")
+            return
+
         alerts = []
         movers = []
+        candidate_symbols: List[str] = []
 
         for symbol, frame in intraday_data.items():
             cleaned = self._prepare_intraday_frame(frame)
@@ -131,11 +188,32 @@ class IntradayStockScanner:
 
             current_price = float(cleaned["Close"].iloc[-1])
             current_volume = float(cleaned["Volume"].iloc[-1])
+            cumulative_volume = float(cleaned["Volume"].sum())
+            if cumulative_volume < 50_000:
+                continue
             session_open = float(cleaned["Open"].iloc[0])
             intraday_change = ((current_price / session_open) - 1.0) * 100 if session_open else math.nan
             vwap = self._calculate_vwap(cleaned)
             rsi = self._calculate_rsi(cleaned)
             opening_range = self._opening_range(cleaned)
+            metrics = daily_metrics.get(symbol, {})
+            average_daily_volume = metrics.get("average_daily_volume")
+            previous_day_low = metrics.get("previous_day_low")
+            previous_close = metrics.get("previous_close")
+            atr = metrics.get("atr")
+
+            if average_daily_volume is not None and average_daily_volume < self.config.min_average_daily_volume:
+                continue
+
+            atr_percent = None
+            if atr is not None and previous_close:
+                atr_percent = (atr / previous_close) * 100
+            if atr_percent is not None and atr_percent < self.config.min_atr_percent:
+                continue
+
+            relative_volume = None
+            if average_daily_volume:
+                relative_volume = cumulative_volume / average_daily_volume
 
             movers.append(
                 {
@@ -154,9 +232,15 @@ class IntradayStockScanner:
             if self._has_intraday_price_drop(cleaned):
                 signals.append("price drop")
 
-            previous_day_low = previous_day_lows.get(symbol)
             if previous_day_low is not None and current_price < previous_day_low:
                 signals.append("support break")
+
+            gap_percent = self._gap_percent(session_open, previous_close)
+            if gap_percent is not None:
+                if gap_percent <= -abs(self.config.gap_threshold_percent):
+                    signals.append("gap down")
+                if gap_percent >= abs(self.config.gap_threshold_percent):
+                    signals.append("gap up")
 
             if volume_spike and vwap is not None and current_price < vwap:
                 signals.append("VWAP breakdown")
@@ -170,7 +254,7 @@ class IntradayStockScanner:
                 if current_price > opening_range["high"]:
                     signals.append("Opening Range Breakout")
 
-            if rsi is not None:
+            if rsi is not None and volume_spike:
                 if rsi > 70:
                     signals.append("RSI overbought")
                 if rsi < 30:
@@ -180,7 +264,9 @@ class IntradayStockScanner:
                 signals.append("market bearish")
 
             score = self._score_signals(signals)
+            suggested_bias = self._suggested_bias(signals, market_trend)
             if signals and score >= 3:
+                candidate_symbols.append(symbol)
                 alerts.append(
                     {
                         "symbol": symbol,
@@ -190,7 +276,18 @@ class IntradayStockScanner:
                         "intraday_change": intraday_change,
                         "vwap": vwap,
                         "rsi": rsi,
+                        "gap_percent": gap_percent,
+                        "relative_volume": relative_volume,
                         "market_trend": market_trend,
+                        "suggested_bias": suggested_bias,
+                        "confluence_strength": self._confluence_strength(signals),
+                        "priority": self._priority_score(
+                            score,
+                            relative_volume,
+                            gap_percent,
+                            market_trend,
+                            suggested_bias,
+                        ),
                     }
                 )
 
@@ -199,36 +296,84 @@ class IntradayStockScanner:
         self._print_top_movers("Top Intraday Losers", top_losers)
         self._print_top_movers("Top Intraday Gainers", top_gainers)
 
-        if not alerts:
+        higher_timeframe_data = self._download_higher_timeframe_data(scan_cache, candidate_symbols)
+        alerts = [
+            {
+                **alert,
+                "higher_timeframe_trend": self._higher_timeframe_trend(
+                    higher_timeframe_data.get(str(alert["symbol"]), pd.DataFrame())
+                ),
+            }
+            for alert in alerts
+        ]
+        alerts = [
+            alert
+            for alert in alerts
+            if self._trend_matches_bias(str(alert["higher_timeframe_trend"]), str(alert["suggested_bias"]))
+        ]
+
+        confirmed_alerts = self._confirm_alerts(alerts)
+        if not confirmed_alerts:
             logger.info("No active alerts generated.")
             print("No active alerts.")
             return
 
-        for alert in alerts:
+        confirmed_alerts.sort(key=lambda alert: (alert["priority"], abs(alert["intraday_change"])), reverse=True)
+        ranked_alerts = confirmed_alerts[: self.config.max_ranked_alerts]
+
+        for alert in ranked_alerts:
             signature = " + ".join(alert["signals"])
             if not self._should_send_alert(alert["symbol"], signature):
                 continue
+            if abs(float(alert["intraday_change"])) < 0.5:
+                continue
+            if self._symbol_alert_limit_reached(str(alert["symbol"]), now.date()):
+                continue
 
             message = self._format_alert_message(alert)
-            logger.info("Alert generated for %s | %s", alert["symbol"], signature)
+            logger.info(
+                "Alert generated for %s | score=%s priority=%.2f signals=%s",
+                alert["symbol"],
+                alert["score"],
+                alert["priority"],
+                signature,
+            )
             print(message)
             print("-" * 40)
             self._send_telegram_alert(message)
+            self._record_sent_alert(alert, now)
+        elapsed = time.perf_counter() - started_at
+        logger.info("Scan completed in %.1f seconds.", elapsed)
 
     def _format_alert_message(self, alert: Dict[str, object]) -> str:
+        timestamp_text = datetime.now(IST).strftime("%H:%M IST")
         vwap = alert["vwap"]
         rsi = alert["rsi"]
+        gap_percent = alert["gap_percent"]
+        display_symbol = self._display_symbol(str(alert["symbol"]))
         vwap_text = f"{RUPEE}{vwap:.2f}" if isinstance(vwap, float) else "N/A"
         rsi_text = f"{rsi:.2f}" if isinstance(rsi, float) else "N/A"
+        gap_text = f"{gap_percent:.2f}%" if isinstance(gap_percent, float) else "N/A"
+        confidence = self._confidence_level(int(alert["score"]), str(alert["confluence_strength"]))
+        tv_symbol = display_symbol
+        friendly_signals = "\n".join(
+            f"- {self._friendly_signal_text(str(signal), rsi_text, gap_text)}"
+            for signal in alert["signals"]
+        )
         return (
-            "ALERT\n"
-            f"Stock: {alert['symbol']}\n"
-            f"Price: {RUPEE}{alert['price']:.2f}\n"
-            f"Signals: {', '.join(alert['signals'])}\n"
-            f"Score: {alert['score']}\n"
-            f"VWAP: {vwap_text}\n"
-            f"RSI: {rsi_text}\n"
-            f"Market Trend: {alert['market_trend']}"
+            "🚨 TRADE ALERT\n\n"
+            f"Time: {timestamp_text}\n"
+            f"Stock: {display_symbol}\n"
+            f"Price: {RUPEE}{alert['price']:.2f}\n\n"
+            f"Possible Action: {alert['suggested_bias']}\n\n"
+            f"Why this signal appeared:\n{friendly_signals}\n\n"
+            f"Signal Strength: {alert['score']}\n\n"
+            f"Priority Score: {alert['priority']:.2f}\n\n"
+            f"Confluence: {alert['confluence_strength']}\n\n"
+            f"Confidence: {confidence}\n\n"
+            f"Market Trend: {alert['market_trend']}\n"
+            f"Higher Timeframe: {alert['higher_timeframe_trend']}\n\n"
+            f"Chart:\nhttps://www.tradingview.com/chart/?symbol=NSE:{tv_symbol}"
         )
 
     def _download_intraday_data(
@@ -243,12 +388,68 @@ class IntradayStockScanner:
             interval=self.config.intraday_interval,
         )
 
-    def _download_previous_day_lows(
+    def _download_higher_timeframe_data(
         self,
         scan_cache: Dict[Tuple[str, str, str], Dict[str, pd.DataFrame]],
         symbols: List[str],
-    ) -> Dict[str, float]:
-        previous_day_lows: Dict[str, float] = {}
+    ) -> Dict[str, pd.DataFrame]:
+        return self._download_symbol_batches(
+            scan_cache=scan_cache,
+            symbols=symbols,
+            period=self.config.intraday_period,
+            interval="15m",
+        )
+
+    def _update_daily_watchlist(
+        self,
+        intraday_data: Dict[str, pd.DataFrame],
+        daily_metrics: Dict[str, Dict[str, float]],
+    ) -> None:
+        now = datetime.now(IST)
+        today = now.date()
+        if self.daily_watchlist_date != today:
+            self.daily_watchlist = []
+            self.daily_watchlist_date = today
+
+        if now.time() >= dt_time(hour=9, minute=30) and self.daily_watchlist:
+            return
+
+        candidates = []
+        for symbol, frame in intraday_data.items():
+            cleaned = self._prepare_intraday_frame(frame)
+            early_metrics = self._early_activity_metrics(cleaned, daily_metrics.get(symbol, {}))
+            if early_metrics is None:
+                continue
+            candidates.append({"symbol": symbol, **early_metrics})
+
+        if not candidates:
+            return
+
+        ranked = sorted(
+            candidates,
+            key=lambda row: (abs(row["gap_percent"]), row["early_volume"], abs(row["early_price_change"])),
+            reverse=True,
+        )
+        new_watchlist = [row["symbol"] for row in ranked[:10]]
+        if new_watchlist != self.daily_watchlist:
+            self.daily_watchlist = new_watchlist
+            logger.info("Daily watchlist for %s: %s", today.isoformat(), ", ".join(self.daily_watchlist))
+
+    def _symbols_for_current_cycle(self, available_symbols: Iterable[str]) -> List[str]:
+        now = datetime.now(IST)
+        available_list = list(available_symbols)
+        if now.time() >= dt_time(hour=9, minute=30) and self.daily_watchlist:
+            watchlist = [symbol for symbol in self.daily_watchlist if symbol in available_list]
+            if watchlist:
+                return watchlist
+        return available_list
+
+    def _download_daily_metrics(
+        self,
+        scan_cache: Dict[Tuple[str, str, str], Dict[str, pd.DataFrame]],
+        symbols: List[str],
+    ) -> Dict[str, Dict[str, float]]:
+        metrics_by_symbol: Dict[str, Dict[str, float]] = {}
         daily_data = self._download_symbol_batches(
             scan_cache=scan_cache,
             symbols=symbols,
@@ -263,11 +464,20 @@ class IntradayStockScanner:
 
             cleaned.index = pd.to_datetime(cleaned.index)
             completed_days = cleaned[cleaned.index.date < today]
-            if completed_days.empty:
+            if len(completed_days) < 2:
                 continue
 
-            previous_day_lows[symbol] = float(completed_days["Low"].iloc[-1])
-        return previous_day_lows
+            average_daily_volume = float(completed_days["Volume"].tail(20).mean())
+            previous_close = float(completed_days["Close"].iloc[-1])
+            previous_day_low = float(completed_days["Low"].iloc[-1])
+            atr = self._calculate_atr(completed_days, self.config.atr_period)
+            metrics_by_symbol[symbol] = {
+                "average_daily_volume": average_daily_volume,
+                "previous_close": previous_close,
+                "previous_day_low": previous_day_low,
+                "atr": atr if atr is not None else 0.0,
+            }
+        return metrics_by_symbol
 
     def _download_market_indexes(
         self,
@@ -437,6 +647,16 @@ class IntradayStockScanner:
         cumulative = (typical_price * volume).sum()
         return float(cumulative / total_volume)
 
+    def _higher_timeframe_trend(self, frame: pd.DataFrame) -> str:
+        cleaned = self._prepare_intraday_frame(frame)
+        if cleaned.empty:
+            return "bearish"
+        current_price = float(cleaned["Close"].iloc[-1])
+        vwap = self._calculate_vwap(cleaned)
+        if vwap is None:
+            return "bearish"
+        return "bullish" if current_price > vwap else "bearish"
+
     def _has_vwap_rejection(self, frame: pd.DataFrame, vwap: float | None, candles: int = 5) -> bool:
         if vwap is None or len(frame) < 2:
             return False
@@ -444,7 +664,7 @@ class IntradayStockScanner:
         if recent.empty:
             return False
         closes = recent["Close"].astype(float)
-        moved_above_vwap = bool((closes > vwap).any())
+        moved_above_vwap = int((closes > vwap).sum()) >= 2
         current_below_vwap = float(closes.iloc[-1]) < vwap
         return moved_above_vwap and current_below_vwap
 
@@ -467,14 +687,66 @@ class IntradayStockScanner:
     def _opening_range(self, frame: pd.DataFrame) -> Dict[str, float] | None:
         if frame.empty:
             return None
-        session_start = frame.index[0]
-        range_end = session_start + timedelta(minutes=15)
-        opening_range = frame[frame.index < range_end]
+        session_date = frame.index[0].astimezone(IST).date() if frame.index[0].tzinfo else frame.index[0].date()
+        range_start = pd.Timestamp(datetime.combine(session_date, MARKET_OPEN), tz=IST)
+        range_end = pd.Timestamp(datetime.combine(session_date, dt_time(hour=9, minute=30)), tz=IST)
+        if frame.index.tz is not None:
+            range_start = range_start.tz_convert(frame.index.tz)
+            range_end = range_end.tz_convert(frame.index.tz)
+        opening_range = frame[(frame.index >= range_start) & (frame.index < range_end)]
         if opening_range.empty:
             return None
         return {
             "high": float(opening_range["High"].max()),
             "low": float(opening_range["Low"].min()),
+        }
+
+    def _calculate_atr(self, frame: pd.DataFrame, period: int) -> float | None:
+        if len(frame) < period + 1:
+            return None
+        high = frame["High"].astype(float)
+        low = frame["Low"].astype(float)
+        close = frame["Close"].astype(float)
+        previous_close = close.shift(1)
+        true_range = pd.concat(
+            [
+                high - low,
+                (high - previous_close).abs(),
+                (low - previous_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr_series = true_range.rolling(period).mean()
+        last_atr = atr_series.iloc[-1]
+        return float(last_atr) if pd.notna(last_atr) else None
+
+    def _gap_percent(self, session_open: float, previous_close: float | None) -> float | None:
+        if previous_close is None or previous_close <= 0:
+            return None
+        return ((session_open / previous_close) - 1.0) * 100
+
+    def _early_activity_metrics(
+        self,
+        frame: pd.DataFrame,
+        daily_metrics: Dict[str, float],
+    ) -> Dict[str, float] | None:
+        if frame.empty:
+            return None
+        opening_range = self._opening_range(frame)
+        if opening_range is None:
+            return None
+        early_frame = self._slice_opening_window(frame)
+        if early_frame.empty:
+            return None
+        previous_close = daily_metrics.get("previous_close")
+        session_open = float(frame["Open"].iloc[0])
+        early_close = float(early_frame["Close"].iloc[-1])
+        gap_percent = self._gap_percent(session_open, previous_close)
+        early_price_change = ((early_close / session_open) - 1.0) * 100 if session_open > 0 else 0.0
+        return {
+            "gap_percent": gap_percent if gap_percent is not None else 0.0,
+            "early_volume": float(early_frame["Volume"].sum()),
+            "early_price_change": early_price_change,
         }
 
     def _has_intraday_price_drop(self, frame: pd.DataFrame) -> bool:
@@ -500,6 +772,115 @@ class IntradayStockScanner:
 
     def _score_signals(self, signals: Sequence[str]) -> int:
         return sum(ALERT_SIGNAL_SCORES.get(signal, 0) for signal in signals)
+
+    def _confluence_strength(self, signals: Sequence[str]) -> str:
+        categories = {SIGNAL_CATEGORIES[signal] for signal in signals if signal in SIGNAL_CATEGORIES}
+        if len(categories) >= 3:
+            return "Strong"
+        if len(categories) == 2:
+            return "Moderate"
+        return "Weak"
+
+    def _priority_score(
+        self,
+        score: int,
+        relative_volume: float | None,
+        gap_percent: float | None,
+        market_trend: str,
+        suggested_bias: str,
+    ) -> float:
+        priority = float(score)
+        if relative_volume is not None:
+            priority += relative_volume
+        if gap_percent is not None:
+            priority += abs(gap_percent) / 2
+        if market_trend == "bearish" and suggested_bias == "SHORT":
+            priority += 0.5
+        if market_trend == "bullish" and suggested_bias == "LONG":
+            priority += 0.5
+        return priority
+
+    def _confidence_level(self, score: int, confluence_strength: str) -> str:
+        if score >= 4 and confluence_strength == "Strong":
+            return "High"
+        if score >= 3 and confluence_strength in {"Strong", "Moderate"}:
+            return "Medium"
+        return "Low"
+
+    def _friendly_signal_text(self, signal: str, rsi_text: str, gap_text: str) -> str:
+        descriptions = {
+            "volume spike": "trading volume is much higher than normal",
+            "price drop": "price fell quickly in the last few minutes",
+            "support break": "price dropped below the previous day's low",
+            "VWAP breakdown": "price slipped below the session average price",
+            "VWAP rejection": "price tried to move above the average price and failed",
+            "Opening Range Breakdown": "price fell below the first 15-minute range",
+            "Opening Range Breakout": "price moved above the first 15-minute range",
+            "RSI overbought": f"momentum looks overheated (RSI {rsi_text})",
+            "RSI oversold": f"momentum looks weak or washed out (RSI {rsi_text})",
+            "market bearish": "the broader market is trading weak",
+            "gap down": f"the stock opened sharply lower today ({gap_text})",
+            "gap up": f"the stock opened sharply higher today ({gap_text})",
+        }
+        return descriptions.get(signal, signal)
+
+    def _confirm_alerts(self, alerts: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        active_keys = set()
+        confirmed: List[Dict[str, object]] = []
+
+        for alert in alerts:
+            signature = " + ".join(alert["signals"])
+            key = (str(alert["symbol"]), signature)
+            active_keys.add(key)
+            count = self.pending_signals.get(key, 0) + 1
+            self.pending_signals[key] = count
+            if count >= 2:
+                confirmed.append(alert)
+
+        stale_keys = [key for key in self.pending_signals if key not in active_keys]
+        for key in stale_keys:
+            del self.pending_signals[key]
+
+        return confirmed
+
+    def _suggested_bias(self, signals: Sequence[str], market_trend: str) -> str:
+        short_signals = {
+            "VWAP breakdown",
+            "VWAP rejection",
+            "support break",
+            "Opening Range Breakdown",
+            "price drop",
+            "market bearish",
+            "gap down",
+        }
+        long_signals = {
+            "Opening Range Breakout",
+            "RSI oversold",
+            "gap up",
+        }
+        short_score = sum(1 for signal in signals if signal in short_signals)
+        long_score = sum(1 for signal in signals if signal in long_signals)
+        if market_trend == "bearish":
+            short_score += 1
+        if short_score >= long_score:
+            return "SHORT"
+        return "LONG"
+
+    def _slice_opening_window(self, frame: pd.DataFrame) -> pd.DataFrame:
+        session_date = frame.index[0].astimezone(IST).date() if frame.index[0].tzinfo else frame.index[0].date()
+        range_start = pd.Timestamp(datetime.combine(session_date, MARKET_OPEN), tz=IST)
+        range_end = pd.Timestamp(datetime.combine(session_date, dt_time(hour=9, minute=30)), tz=IST)
+        if frame.index.tz is not None:
+            range_start = range_start.tz_convert(frame.index.tz)
+            range_end = range_end.tz_convert(frame.index.tz)
+        return frame[(frame.index >= range_start) & (frame.index < range_end)]
+
+    def _trend_matches_bias(self, trend: str, bias: str) -> bool:
+        if bias == "LONG":
+            return trend == "bullish"
+        if bias == "SHORT":
+            return trend == "bearish"
+        return False
 
     def _print_top_movers(self, title: str, rows: List[Dict[str, float]]) -> None:
         if not rows:
@@ -534,12 +915,89 @@ class IntradayStockScanner:
 
         url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
         payload = {"chat_id": self.config.telegram_chat_id, "text": message}
-        try:
-            response = requests.post(url, json=payload, timeout=self.config.request_timeout_seconds)
-            response.raise_for_status()
-            logger.info("Telegram alert sent successfully.")
-        except requests.RequestException as exc:
-            logger.exception("Telegram alert failed: %s", exc)
+        delays = [1, 2, 4]
+        for attempt in range(1, 5):
+            try:
+                response = requests.post(url, json=payload, timeout=self.config.request_timeout_seconds)
+                response.raise_for_status()
+                logger.info("Telegram alert sent successfully.")
+                return
+            except requests.RequestException as exc:
+                logger.exception("Telegram alert failed on attempt %s: %s", attempt, exc)
+                if attempt <= len(delays):
+                    time.sleep(delays[attempt - 1])
+
+    def _symbol_alert_limit_reached(self, symbol: str, today: datetime.date) -> bool:
+        return self.daily_symbol_alert_count.get((symbol, today), 0) >= 3
+
+    def _record_sent_alert(self, alert: Dict[str, object], now: datetime) -> None:
+        symbol = str(alert["symbol"])
+        today = now.date()
+        key = (symbol, today)
+        self.daily_symbol_alert_count[key] = self.daily_symbol_alert_count.get(key, 0) + 1
+        self.total_alerts_generated += 1
+        self.unique_symbols_alerted.add(symbol)
+        self.recent_alerts.appendleft(
+            {
+                "time": now.strftime("%H:%M IST"),
+                "symbol": self._display_symbol(symbol),
+                "price": round(float(alert["price"]), 2),
+                "action": str(alert["suggested_bias"]),
+                "score": int(alert["score"]),
+                "priority": round(float(alert["priority"]), 2),
+                "confluence": str(alert["confluence_strength"]),
+                "confidence": self._confidence_level(int(alert["score"]), str(alert["confluence_strength"])),
+                "signals": " + ".join(str(signal) for signal in alert["signals"]),
+            }
+        )
+        if int(alert["score"]) >= 4 and str(alert["confluence_strength"]) == "Strong":
+            self.strong_alerts_count += 1
+            self._log_strong_signal(alert, now)
+
+    def _log_strong_signal(self, alert: Dict[str, object], now: datetime) -> None:
+        with STRONG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{now.strftime('%Y-%m-%d %H:%M:%S %Z')} | "
+                f"{alert['symbol']} | "
+                f"{' + '.join(str(signal) for signal in alert['signals'])} | "
+                f"score={alert['score']} | priority={alert['priority']:.2f}\n"
+            )
+
+    def _reset_daily_state_if_needed(self, now: datetime) -> None:
+        today = now.date()
+        if self.daily_counters_date == today:
+            return
+        self.daily_counters_date = today
+        self.daily_symbol_alert_count = {}
+        self.total_alerts_generated = 0
+        self.strong_alerts_count = 0
+        self.unique_symbols_alerted = set()
+        self.daily_summary_sent_date = None
+
+    def _send_daily_summary_if_needed(self, now: datetime) -> None:
+        if self.config.force_market_open:
+            return
+        if now.weekday() >= 5 or now.time() < MARKET_CLOSE:
+            return
+        if self.daily_summary_sent_date == now.date():
+            return
+        summary = (
+            "Daily Scanner Summary\n\n"
+            f"Total Alerts: {self.total_alerts_generated}\n"
+            f"Strong Alerts: {self.strong_alerts_count}\n"
+            f"Unique Symbols: {len(self.unique_symbols_alerted)}\n"
+            f"Strong Signal Rate: {self._strong_signal_rate():.2f}%"
+        )
+        self._send_telegram_alert(summary)
+        self.daily_summary_sent_date = now.date()
+
+    def _strong_signal_rate(self) -> float:
+        if self.total_alerts_generated == 0:
+            return 0.0
+        return (self.strong_alerts_count / self.total_alerts_generated) * 100
+
+    def _display_symbol(self, symbol: str) -> str:
+        return symbol.removesuffix(".NS")
 
 
 def load_config(path: Path) -> ScannerConfig:
@@ -565,7 +1023,13 @@ def load_config(path: Path) -> ScannerConfig:
         top_losers_count=int(data.get("top_losers_count", 5)),
         top_gainers_count=int(data.get("top_gainers_count", 5)),
         market_bearish_threshold_percent=float(data.get("market_bearish_threshold_percent", 0.5)),
+        gap_threshold_percent=float(data.get("gap_threshold_percent", 2.0)),
+        min_average_daily_volume=int(data.get("min_average_daily_volume", 1_000_000)),
+        atr_period=int(data.get("atr_period", 14)),
+        min_atr_percent=float(data.get("min_atr_percent", 1.0)),
+        max_ranked_alerts=int(data.get("max_ranked_alerts", 5)),
         repeat_alert_after_minutes=int(data["repeat_alert_after_minutes"]),
+        force_market_open=bool(data.get("force_market_open", False)),
         stock_mode=str(data.get("stock_mode", "full")).strip().lower(),
         custom_watchlist=[
             str(symbol).strip()
@@ -619,7 +1083,9 @@ def env_value(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-def is_market_open(now: datetime | None = None) -> bool:
+def is_market_open(force_market_open: bool = False, now: datetime | None = None) -> bool:
+    if force_market_open:
+        return True
     current = now.astimezone(IST) if now else datetime.now(IST)
     if current.weekday() >= 5:
         return False
@@ -627,10 +1093,20 @@ def is_market_open(now: datetime | None = None) -> bool:
     return MARKET_OPEN <= current_time <= MARKET_CLOSE
 
 
+def is_alert_window(now: datetime | None = None) -> bool:
+    current = now.astimezone(IST) if now else datetime.now(IST)
+    if current.weekday() >= 5:
+        return False
+    current_time = current.time().replace(tzinfo=None)
+    return ALERT_START <= current_time <= ALERT_END
+
+
 def scanner_loop() -> None:
+    global scanner_instance
     config = load_config(CONFIG_PATH)
     symbols = load_symbols(config, STOCK_LIST_PATH)
     scanner = IntradayStockScanner(config, symbols)
+    scanner_instance = scanner
 
     scanner.run_once()
     schedule.every(config.refresh_interval_seconds).seconds.do(scanner.run_once)
@@ -661,6 +1137,65 @@ def healthcheck() -> str:
     return "scanner running"
 
 
+@app.get("/dashboard")
+def dashboard() -> Response:
+    scanner = scanner_instance
+    alerts = list(scanner.recent_alerts)[:20] if scanner else []
+    last_scan = "N/A"
+    if scanner and scanner.last_scan_time:
+        last_scan = datetime.fromisoformat(scanner.last_scan_time).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    watchlist = ", ".join(scanner._display_symbol(symbol) for symbol in scanner.daily_watchlist) if scanner and scanner.daily_watchlist else "N/A"
+    rows = "".join(
+        (
+            "<tr>"
+            f"<td>{alert['time']}</td>"
+            f"<td>{alert['symbol']}</td>"
+            f"<td>{RUPEE}{alert['price']:.2f}</td>"
+            f"<td>{alert['action']}</td>"
+            f"<td>{alert['score']}</td>"
+            f"<td>{alert['priority']:.2f}</td>"
+            f"<td>{alert['confluence']}</td>"
+            f"<td>{alert['confidence']}</td>"
+            f"<td>{alert['signals']}</td>"
+            "</tr>"
+        )
+        for alert in alerts
+    )
+    html = (
+        "<html><head><title>Scanner Dashboard</title>"
+        "<meta http-equiv='refresh' content='30'>"
+        "<style>body{font-family:Arial,sans-serif;padding:20px;}table{border-collapse:collapse;width:100%;}"
+        "th,td{border:1px solid #ccc;padding:8px;text-align:left;}th{background:#f4f4f4;}</style>"
+        "</head><body><h1>Intraday Stock Scanner Dashboard</h1>"
+        f"<p><strong>Last Scan:</strong> {last_scan}</p>"
+        f"<p><strong>Today's Watchlist:</strong> {watchlist}</p>"
+        "<table><thead><tr><th>Time</th><th>Symbol</th><th>Price</th><th>Action</th><th>Score</th>"
+        "<th>Priority</th><th>Confluence</th><th>Confidence</th><th>Signals</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></body></html>"
+    )
+    return Response(html, mimetype="text/html")
+
+
+@app.get("/alerts")
+def alerts_history() -> Response:
+    scanner = scanner_instance
+    alerts = list(scanner.recent_alerts)[:50] if scanner else []
+    return jsonify(alerts)
+
+
+@app.get("/status")
+def scanner_status() -> Response:
+    scanner = scanner_instance
+    payload = {
+        "scanner_running": bool(scanner_thread and scanner_thread.is_alive()),
+        "watchlist_size": len(scanner.daily_watchlist) if scanner else 0,
+        "symbols_total": len(scanner.symbols) if scanner else 0,
+        "last_scan_time": scanner.last_scan_time if scanner else None,
+        "alerts_today": scanner.total_alerts_generated if scanner else 0,
+    }
+    return jsonify(payload)
+
+
 @app.get("/test-telegram")
 def test_telegram() -> Response:
     expected_token = env_value("TEST_ENDPOINT_TOKEN")
@@ -677,6 +1212,39 @@ def test_telegram() -> Response:
     timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
     scanner._send_telegram_alert(f"Telegram test from Intraday Stock Scanner at {timestamp}")
     return Response("telegram test sent", status=200)
+
+
+@app.get("/test-alert")
+def test_alert() -> Response:
+    expected_token = env_value("TEST_ENDPOINT_TOKEN")
+    provided_token = request.args.get("token", "").strip()
+
+    if not expected_token:
+        return Response("test endpoint is disabled", status=403)
+
+    if provided_token != expected_token:
+        return Response("unauthorized", status=401)
+
+    config = load_config(CONFIG_PATH)
+    scanner = IntradayStockScanner(config, [])
+    sample_alert = {
+        "symbol": "SBIN.NS",
+        "price": 785.20,
+        "signals": ["VWAP breakdown", "volume spike", "market bearish"],
+        "score": 4,
+        "priority": 6.80,
+        "vwap": 790.10,
+        "rsi": 28.40,
+        "gap_percent": -1.20,
+        "market_trend": "bearish",
+        "higher_timeframe_trend": "bearish",
+        "suggested_bias": "SHORT",
+        "confluence_strength": "Strong",
+        "intraday_change": -2.43,
+    }
+    message = scanner._format_alert_message(sample_alert)
+    scanner._send_telegram_alert(message)
+    return Response(message, status=200, mimetype="text/plain")
 
 
 if env_flag("RUN_SCANNER", True):
