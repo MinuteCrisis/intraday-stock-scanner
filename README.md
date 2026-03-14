@@ -59,6 +59,7 @@ Preferred cloud configuration uses environment variables:
 
 ```text
 RUN_SCANNER=true
+TEST_ENDPOINT_TOKEN=change_this_test_token
 TELEGRAM_ENABLED=true
 TELEGRAM_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
@@ -80,6 +81,8 @@ Environment variables override `config.json` values.
 
 - `RUN_SCANNER=true` starts the scanner and the web server
 - `RUN_SCANNER=false` starts only the web server
+
+`TEST_ENDPOINT_TOKEN` protects the Telegram test endpoint.
 
 ## Deployment Notes
 
@@ -107,6 +110,7 @@ Health Check Path: /
 
 ```text
 RUN_SCANNER=true
+TEST_ENDPOINT_TOKEN=change_this_test_token
 TELEGRAM_ENABLED=true
 TELEGRAM_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
@@ -131,6 +135,7 @@ git remote add origin https://github.com/YOUR_USERNAME/intraday-stock-scanner.gi
 ## Verification
 
 - `GET /` should return `scanner running`
+- `GET /test-telegram?token=YOUR_TEST_ENDPOINT_TOKEN` should return `telegram test sent`
 - `Procfile` points gunicorn at `main:app`
 - `runtime.txt` pins Python `3.12.9`
 - Telegram env vars are supported through `.env.example` and `main.py`
@@ -166,3 +171,4 @@ Then in Render:
 - The scanner suppresses duplicate alerts for the same stock and signal combination for 10 minutes by default.
 - If you run both local and cloud with `RUN_SCANNER=true`, both instances will scan and both can send Telegram alerts.
 - Recommended setup: keep cloud on `RUN_SCANNER=true`; use local with `RUN_SCANNER=false` unless you intentionally want a second scanner.
+- The Telegram test endpoint is intentionally protected by `TEST_ENDPOINT_TOKEN`; do not leave it blank on a public deployment.

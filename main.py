@@ -16,6 +16,8 @@ import requests
 import schedule
 import yfinance as yf
 from flask import Flask
+from flask import Response
+from flask import request
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -348,6 +350,10 @@ def env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_value(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
 def is_market_open(now: datetime | None = None) -> bool:
     current = now.astimezone(IST) if now else datetime.now(IST)
     if current.weekday() >= 5:
@@ -387,6 +393,24 @@ def start_background_scanner() -> None:
 @app.get("/")
 def healthcheck() -> str:
     return "scanner running"
+
+
+@app.get("/test-telegram")
+def test_telegram() -> Response:
+    expected_token = env_value("TEST_ENDPOINT_TOKEN")
+    provided_token = request.args.get("token", "").strip()
+
+    if not expected_token:
+        return Response("test endpoint is disabled", status=403)
+
+    if provided_token != expected_token:
+        return Response("unauthorized", status=401)
+
+    config = load_config(CONFIG_PATH)
+    scanner = IntradayStockScanner(config, [])
+    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+    scanner._send_telegram_alert(f"Telegram test from Intraday Stock Scanner at {timestamp}")
+    return Response("telegram test sent", status=200)
 
 
 if env_flag("RUN_SCANNER", True):
