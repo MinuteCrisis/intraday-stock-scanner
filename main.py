@@ -341,6 +341,13 @@ def chunked(items: List[str], size: int) -> Iterable[List[str]]:
         yield items[start:start + size]
 
 
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def is_market_open(now: datetime | None = None) -> bool:
     current = now.astimezone(IST) if now else datetime.now(IST)
     if current.weekday() >= 5:
@@ -382,7 +389,10 @@ def healthcheck() -> str:
     return "scanner running"
 
 
-start_background_scanner()
+if env_flag("RUN_SCANNER", True):
+    start_background_scanner()
+else:
+    print("RUN_SCANNER is disabled. Web server will start without the background scanner.")
 
 
 def main() -> None:

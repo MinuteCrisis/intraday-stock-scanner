@@ -58,6 +58,7 @@ scanner running
 Preferred cloud configuration uses environment variables:
 
 ```text
+RUN_SCANNER=true
 TELEGRAM_ENABLED=true
 TELEGRAM_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
@@ -75,6 +76,11 @@ Local fallback is still available in `config.json`:
 
 Environment variables override `config.json` values.
 
+`RUN_SCANNER` controls whether the background scanner starts:
+
+- `RUN_SCANNER=true` starts the scanner and the web server
+- `RUN_SCANNER=false` starts only the web server
+
 ## Deployment Notes
 
 - Build command: `pip install -r requirements.txt`
@@ -82,6 +88,7 @@ Environment variables override `config.json` values.
 - Health check path: `/`
 - Procfile command: `python main.py`
 - The scanner thread starts automatically when the Flask app loads
+- Set `RUN_SCANNER=true` on the instance that should actively scan
 
 ## Render Deployment
 
@@ -99,6 +106,7 @@ Health Check Path: /
 4. Add environment variables in Render:
 
 ```text
+RUN_SCANNER=true
 TELEGRAM_ENABLED=true
 TELEGRAM_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
@@ -156,3 +164,5 @@ Then in Render:
 - Yahoo Finance is free and unofficial, so temporary throttling or missing candles can happen.
 - If throttling appears, reduce `batch_size` or increase `batch_pause_seconds` in `config.json`.
 - The scanner suppresses duplicate alerts for the same stock and signal combination for 10 minutes by default.
+- If you run both local and cloud with `RUN_SCANNER=true`, both instances will scan and both can send Telegram alerts.
+- Recommended setup: keep cloud on `RUN_SCANNER=true`; use local with `RUN_SCANNER=false` unless you intentionally want a second scanner.
