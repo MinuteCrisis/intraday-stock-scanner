@@ -35,6 +35,15 @@ INDEX_SYMBOLS = {
     "NIFTY": "^NSEI",
     "BANKNIFTY": "^NSEBANK",
 }
+ALERT_SIGNAL_SCORES = {
+    "VWAP breakdown": 2,
+    "VWAP rejection": 2,
+    "volume spike": 2,
+    "support break": 2,
+    "Opening Range Breakdown": 2,
+    "price drop": 1,
+    "market bearish": 1,
+}
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -125,6 +134,8 @@ class IntradayStockScanner:
             session_open = float(cleaned["Open"].iloc[0])
             intraday_change = ((current_price / session_open) - 1.0) * 100 if session_open else math.nan
             vwap = self._calculate_vwap(cleaned)
+            rsi = self._calculate_rsi(cleaned)
+            opening_range = self._opening_range(cleaned)
 
             movers.append(
                 {
@@ -150,17 +161,35 @@ class IntradayStockScanner:
             if volume_spike and vwap is not None and current_price < vwap:
                 signals.append("VWAP breakdown")
 
+            if volume_spike and self._has_vwap_rejection(cleaned, vwap):
+                signals.append("VWAP rejection")
+
+            if opening_range is not None:
+                if current_price < opening_range["low"]:
+                    signals.append("Opening Range Breakdown")
+                if current_price > opening_range["high"]:
+                    signals.append("Opening Range Breakout")
+
+            if rsi is not None:
+                if rsi > 70:
+                    signals.append("RSI overbought")
+                if rsi < 30:
+                    signals.append("RSI oversold")
+
             if market_bearish:
                 signals.append("market bearish")
 
-            if signals:
+            score = self._score_signals(signals)
+            if signals and score >= 3:
                 alerts.append(
                     {
                         "symbol": symbol,
                         "price": current_price,
                         "signals": signals,
+                        "score": score,
                         "intraday_change": intraday_change,
                         "vwap": vwap,
+                        "rsi": rsi,
                         "market_trend": market_trend,
                     }
                 )
@@ -188,14 +217,17 @@ class IntradayStockScanner:
 
     def _format_alert_message(self, alert: Dict[str, object]) -> str:
         vwap = alert["vwap"]
+        rsi = alert["rsi"]
         vwap_text = f"{RUPEE}{vwap:.2f}" if isinstance(vwap, float) else "N/A"
+        rsi_text = f"{rsi:.2f}" if isinstance(rsi, float) else "N/A"
         return (
             "ALERT\n"
             f"Stock: {alert['symbol']}\n"
             f"Price: {RUPEE}{alert['price']:.2f}\n"
-            f"Signal: {' + '.join(alert['signals'])}\n"
-            f"Intraday Change: {alert['intraday_change']:.2f}%\n"
+            f"Signals: {', '.join(alert['signals'])}\n"
+            f"Score: {alert['score']}\n"
             f"VWAP: {vwap_text}\n"
+            f"RSI: {rsi_text}\n"
             f"Market Trend: {alert['market_trend']}"
         )
 
@@ -248,22 +280,36 @@ class IntradayStockScanner:
             interval=self.config.intraday_interval,
         )
         snapshot: Dict[str, object] = {"market_bearish": False, "market_trend": "bullish"}
-        bearish = False
+        index_trends: List[str] = []
 
         for label, symbol in INDEX_SYMBOLS.items():
             frame = self._prepare_intraday_frame(frames.get(symbol, pd.DataFrame()))
             change_percent = 0.0
+            current_price = None
+            vwap = None
+            trend = "bullish"
             if not frame.empty and len(frame) >= 1:
                 session_open = float(frame["Open"].iloc[0])
                 current_price = float(frame["Close"].iloc[-1])
                 if session_open > 0:
                     change_percent = ((current_price / session_open) - 1.0) * 100
-            if change_percent <= -abs(self.config.market_bearish_threshold_percent):
-                bearish = True
-            snapshot[label] = {"symbol": symbol, "change_percent": change_percent}
+                vwap = self._calculate_vwap(frame)
+                if vwap is not None:
+                    trend = "bearish" if current_price < vwap else "bullish"
+                elif change_percent <= -abs(self.config.market_bearish_threshold_percent):
+                    trend = "bearish"
+            index_trends.append(trend)
+            snapshot[label] = {
+                "symbol": symbol,
+                "change_percent": change_percent,
+                "vwap": vwap,
+                "current_price": current_price,
+                "trend": trend,
+            }
 
-        snapshot["market_bearish"] = bearish
-        snapshot["market_trend"] = "bearish" if bearish else "bullish"
+        market_bearish = any(trend == "bearish" for trend in index_trends)
+        snapshot["market_bearish"] = market_bearish
+        snapshot["market_trend"] = "bearish" if market_bearish else "bullish"
         return snapshot
 
     def _download_symbol_batches(
@@ -391,6 +437,46 @@ class IntradayStockScanner:
         cumulative = (typical_price * volume).sum()
         return float(cumulative / total_volume)
 
+    def _has_vwap_rejection(self, frame: pd.DataFrame, vwap: float | None, candles: int = 5) -> bool:
+        if vwap is None or len(frame) < 2:
+            return False
+        recent = frame.tail(candles)
+        if recent.empty:
+            return False
+        closes = recent["Close"].astype(float)
+        moved_above_vwap = bool((closes > vwap).any())
+        current_below_vwap = float(closes.iloc[-1]) < vwap
+        return moved_above_vwap and current_below_vwap
+
+    def _calculate_rsi(self, frame: pd.DataFrame, period: int = 14) -> float | None:
+        if len(frame) <= period:
+            return None
+        close = frame["Close"].astype(float)
+        delta = close.diff()
+        gains = delta.clip(lower=0)
+        losses = -delta.clip(upper=0)
+        avg_gain = gains.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+        avg_loss = losses.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+        last_gain = float(avg_gain.iloc[-1])
+        last_loss = float(avg_loss.iloc[-1])
+        if last_loss == 0:
+            return 100.0 if last_gain > 0 else None
+        rs = last_gain / last_loss
+        return float(100 - (100 / (1 + rs)))
+
+    def _opening_range(self, frame: pd.DataFrame) -> Dict[str, float] | None:
+        if frame.empty:
+            return None
+        session_start = frame.index[0]
+        range_end = session_start + timedelta(minutes=15)
+        opening_range = frame[frame.index < range_end]
+        if opening_range.empty:
+            return None
+        return {
+            "high": float(opening_range["High"].max()),
+            "low": float(opening_range["Low"].min()),
+        }
+
     def _has_intraday_price_drop(self, frame: pd.DataFrame) -> bool:
         bars = self.config.price_drop_minutes
         if len(frame) <= bars:
@@ -411,6 +497,9 @@ class IntradayStockScanner:
         valid_rows = [row for row in rows if not math.isnan(row["intraday_change_percent"])]
         valid_rows.sort(key=lambda row: row["intraday_change_percent"], reverse=reverse)
         return valid_rows[:count]
+
+    def _score_signals(self, signals: Sequence[str]) -> int:
+        return sum(ALERT_SIGNAL_SCORES.get(signal, 0) for signal in signals)
 
     def _print_top_movers(self, title: str, rows: List[Dict[str, float]]) -> None:
         if not rows:
@@ -460,7 +549,7 @@ def load_config(path: Path) -> ScannerConfig:
     telegram_token = os.environ.get("TELEGRAM_TOKEN", str(telegram.get("bot_token", "")))
     telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", str(telegram.get("chat_id", "")))
     return ScannerConfig(
-        refresh_interval_seconds=int(data["refresh_interval_seconds"]),
+        refresh_interval_seconds=int(data.get("refresh_interval_seconds", 180)),
         intraday_interval=str(data["intraday_interval"]),
         intraday_period=str(data["intraday_period"]),
         daily_period=str(data["daily_period"]),
