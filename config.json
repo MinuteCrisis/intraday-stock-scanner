@@ -1,0 +1,20 @@
+{
+  "refresh_interval_seconds": 60,
+  "intraday_interval": "1m",
+  "intraday_period": "1d",
+  "daily_period": "10d",
+  "batch_size": 25,
+  "batch_pause_seconds": 2,
+  "request_timeout_seconds": 20,
+  "volume_spike_multiplier": 3.0,
+  "volume_average_bars": 30,
+  "price_drop_minutes": 15,
+  "price_drop_percent": 2.0,
+  "top_losers_count": 5,
+  "repeat_alert_after_minutes": 10,
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": ""
+  }
+}
