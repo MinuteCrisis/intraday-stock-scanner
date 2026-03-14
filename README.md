@@ -78,9 +78,9 @@ Environment variables override `config.json` values.
 ## Deployment Notes
 
 - Build command: `pip install -r requirements.txt`
-- Start command: `gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT main:app`
+- Start command: `python main.py`
 - Health check path: `/`
-- Procfile target: `main:app`
+- Procfile command: `python main.py`
 - The scanner thread starts automatically when the Flask app loads
 
 ## Render Deployment
@@ -92,7 +92,7 @@ Environment variables override `config.json` values.
 ```text
 Environment: Python
 Build Command: pip install -r requirements.txt
-Start Command: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT main:app
+Start Command: python main.py
 Health Check Path: /
 ```
 
@@ -146,7 +146,7 @@ Then in Render:
 1. Open `https://dashboard.render.com/`
 2. Create a new Web Service from the GitHub repo
 3. Set build command to `pip install -r requirements.txt`
-4. Set start command to `gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT main:app`
+4. Set start command to `python main.py`
 5. Set health check path to `/`
 6. Add `TELEGRAM_ENABLED`, `TELEGRAM_TOKEN`, and `TELEGRAM_CHAT_ID`
 7. Deploy
