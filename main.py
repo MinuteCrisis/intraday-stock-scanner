@@ -46,6 +46,12 @@ ALERT_SIGNAL_SCORES = {
     "volume spike": 2,
     "support break": 2,
     "Opening Range Breakdown": 2,
+    "panic selling detected": 2,
+    "panic buying detected": 2,
+    "relative strength vs market": 2,
+    "relative weakness vs market": 2,
+    "accumulation detected": 1,
+    "momentum acceleration": 1,
     "price drop": 1,
     "market bearish": 1,
 }
@@ -59,6 +65,12 @@ SIGNAL_CATEGORIES = {
     "relative volume": "volume",
     "RSI overbought": "momentum",
     "RSI oversold": "momentum",
+    "panic selling detected": "momentum",
+    "panic buying detected": "momentum",
+    "relative strength vs market": "momentum",
+    "relative weakness vs market": "momentum",
+    "accumulation detected": "momentum",
+    "momentum acceleration": "momentum",
     "market bearish": "market",
     "gap up": "market",
     "gap down": "market",
@@ -129,6 +141,7 @@ class IntradayStockScanner:
         self.daily_summary_sent_date: datetime.date | None = None
         self.recent_alerts: deque[Dict[str, object]] = deque(maxlen=100)
         self.last_scan_time: str | None = None
+        self.last_health_warning_time: datetime | None = None
 
     def run_once(self) -> None:
         started_at = time.perf_counter()
@@ -165,6 +178,7 @@ class IntradayStockScanner:
         index_snapshot = self._download_market_indexes(scan_cache)
         market_bearish = index_snapshot["market_bearish"]
         market_trend = index_snapshot["market_trend"]
+        nifty_intraday_change = float(index_snapshot["NIFTY"]["change_percent"])
         logger.info(
             "Market trend %s | NIFTY %.2f%% | BANKNIFTY %.2f%%",
             market_trend,
@@ -225,7 +239,12 @@ class IntradayStockScanner:
 
             signals = []
             avg_volume = self._average_recent_volume(cleaned)
-            volume_spike = bool(avg_volume and current_volume > self.config.volume_spike_multiplier * avg_volume)
+            sustained_volume = self._average_last_n_volumes(cleaned, 3)
+            volume_spike = bool(
+                avg_volume
+                and sustained_volume
+                and sustained_volume > self.config.volume_spike_multiplier * avg_volume
+            )
             if volume_spike:
                 signals.append("volume spike")
 
@@ -260,13 +279,33 @@ class IntradayStockScanner:
                 if rsi < 30:
                     signals.append("RSI oversold")
 
+            if relative_volume is not None:
+                if intraday_change <= -2.5 and relative_volume >= 3:
+                    signals.append("panic selling detected")
+                if intraday_change >= 2.5 and relative_volume >= 3:
+                    signals.append("panic buying detected")
+
+            relative_strength_value = intraday_change - nifty_intraday_change
+            if relative_strength_value >= 2:
+                signals.append("relative strength vs market")
+            if relative_strength_value <= -2:
+                signals.append("relative weakness vs market")
+
+            if self._has_accumulation_pattern(cleaned, current_price):
+                signals.append("accumulation detected")
+
+            if self._has_momentum_acceleration(cleaned):
+                signals.append("momentum acceleration")
+
             if market_bearish:
                 signals.append("market bearish")
 
             score = self._score_signals(signals)
+            categories = {SIGNAL_CATEGORIES[signal] for signal in signals if signal in SIGNAL_CATEGORIES}
             suggested_bias = self._suggested_bias(signals, market_trend)
-            if signals and score >= 3:
+            if signals and score >= 3 and len(categories) >= 2:
                 candidate_symbols.append(symbol)
+                range_potential = self._range_potential(intraday_change, atr_percent)
                 alerts.append(
                     {
                         "symbol": symbol,
@@ -281,6 +320,7 @@ class IntradayStockScanner:
                         "market_trend": market_trend,
                         "suggested_bias": suggested_bias,
                         "confluence_strength": self._confluence_strength(signals),
+                        "range_potential": range_potential,
                         "priority": self._priority_score(
                             score,
                             relative_volume,
@@ -310,6 +350,11 @@ class IntradayStockScanner:
             alert
             for alert in alerts
             if self._trend_matches_bias(str(alert["higher_timeframe_trend"]), str(alert["suggested_bias"]))
+        ]
+        alerts = [
+            alert
+            for alert in alerts
+            if self._market_allows_bias(str(alert["market_trend"]), str(alert["suggested_bias"]))
         ]
 
         confirmed_alerts = self._confirm_alerts(alerts)
@@ -371,6 +416,7 @@ class IntradayStockScanner:
             f"Priority Score: {alert['priority']:.2f}\n\n"
             f"Confluence: {alert['confluence_strength']}\n\n"
             f"Confidence: {confidence}\n\n"
+            f"Range Potential: {alert['range_potential']}\n\n"
             f"Market Trend: {alert['market_trend']}\n"
             f"Higher Timeframe: {alert['higher_timeframe_trend']}\n\n"
             f"Chart:\nhttps://www.tradingview.com/chart/?symbol=NSE:{tv_symbol}"
@@ -381,6 +427,29 @@ class IntradayStockScanner:
         scan_cache: Dict[Tuple[str, str, str], Dict[str, pd.DataFrame]],
         symbols: List[str],
     ) -> Dict[str, pd.DataFrame]:
+        cache_key = (self.config.intraday_period, self.config.intraday_interval, "|".join(symbols))
+        if cache_key in scan_cache:
+            return scan_cache[cache_key]
+
+        try:
+            raw = yf.download(
+                tickers=" ".join(symbols),
+                period=self.config.intraday_period,
+                interval=self.config.intraday_interval,
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=False,
+                timeout=self.config.request_timeout_seconds,
+            )
+            extracted = self._extract_symbol_frames(raw, symbols)
+            if extracted:
+                scan_cache[cache_key] = extracted
+                return extracted
+            logger.warning("Single-call intraday download returned empty data. Falling back to batch download.")
+        except Exception as exc:
+            logger.exception("Single-call intraday download failed. Falling back to batch download: %s", exc)
+
         return self._download_symbol_batches(
             scan_cache=scan_cache,
             symbols=symbols,
@@ -638,6 +707,13 @@ class IntradayStockScanner:
         mean_volume = float(recent.mean())
         return mean_volume if mean_volume > 0 else None
 
+    def _average_last_n_volumes(self, frame: pd.DataFrame, candles: int) -> float | None:
+        if len(frame) < candles:
+            return None
+        recent = frame["Volume"].iloc[-candles:]
+        mean_volume = float(recent.mean())
+        return mean_volume if mean_volume > 0 else None
+
     def _calculate_vwap(self, frame: pd.DataFrame) -> float | None:
         volume = frame["Volume"].astype(float)
         total_volume = float(volume.sum())
@@ -725,6 +801,25 @@ class IntradayStockScanner:
             return None
         return ((session_open / previous_close) - 1.0) * 100
 
+    def _has_accumulation_pattern(self, frame: pd.DataFrame, current_price: float) -> bool:
+        if len(frame) < 10 or current_price <= 0:
+            return False
+        recent = frame.tail(10)
+        max_high = float(recent["High"].max())
+        min_low = float(recent["Low"].min())
+        price_range_percent = ((max_high - min_low) / current_price) * 100
+        first_half_volume = float(recent["Volume"].iloc[:5].mean())
+        second_half_volume = float(recent["Volume"].iloc[5:].mean())
+        return price_range_percent <= 0.8 and second_half_volume > first_half_volume
+
+    def _has_momentum_acceleration(self, frame: pd.DataFrame) -> bool:
+        if len(frame) < 5:
+            return False
+        close = frame["Close"].astype(float)
+        recent_move = abs(float(close.iloc[-1]) - float(close.iloc[-3]))
+        previous_move = abs(float(close.iloc[-3]) - float(close.iloc[-5]))
+        return recent_move > 2 * previous_move
+
     def _early_activity_metrics(
         self,
         frame: pd.DataFrame,
@@ -807,6 +902,16 @@ class IntradayStockScanner:
             return "Medium"
         return "Low"
 
+    def _range_potential(self, intraday_change: float, atr_percent: float | None) -> str:
+        if atr_percent is None or atr_percent <= 0:
+            return "Unknown"
+        rep = abs(intraday_change) / atr_percent
+        if rep < 0.7:
+            return "High"
+        if rep <= 1:
+            return "Medium"
+        return "Low"
+
     def _friendly_signal_text(self, signal: str, rsi_text: str, gap_text: str) -> str:
         descriptions = {
             "volume spike": "trading volume is much higher than normal",
@@ -818,6 +923,12 @@ class IntradayStockScanner:
             "Opening Range Breakout": "price moved above the first 15-minute range",
             "RSI overbought": f"momentum looks overheated (RSI {rsi_text})",
             "RSI oversold": f"momentum looks weak or washed out (RSI {rsi_text})",
+            "panic selling detected": "price is dropping hard with very heavy trading activity",
+            "panic buying detected": "price is rising fast with very heavy trading activity",
+            "relative strength vs market": "this stock is outperforming the NIFTY today",
+            "relative weakness vs market": "this stock is underperforming the NIFTY today",
+            "accumulation detected": "price is staying tight while volume is building up",
+            "momentum acceleration": "price movement is speeding up quickly over the last few candles",
             "market bearish": "the broader market is trading weak",
             "gap down": f"the stock opened sharply lower today ({gap_text})",
             "gap up": f"the stock opened sharply higher today ({gap_text})",
@@ -881,6 +992,13 @@ class IntradayStockScanner:
         if bias == "SHORT":
             return trend == "bearish"
         return False
+
+    def _market_allows_bias(self, market_trend: str, bias: str) -> bool:
+        if market_trend == "bullish":
+            return bias != "SHORT"
+        if market_trend == "bearish":
+            return bias != "LONG"
+        return True
 
     def _print_top_movers(self, title: str, rows: List[Dict[str, float]]) -> None:
         if not rows:
@@ -947,6 +1065,7 @@ class IntradayStockScanner:
                 "priority": round(float(alert["priority"]), 2),
                 "confluence": str(alert["confluence_strength"]),
                 "confidence": self._confidence_level(int(alert["score"]), str(alert["confluence_strength"])),
+                "range_potential": str(alert["range_potential"]),
                 "signals": " + ".join(str(signal) for signal in alert["signals"]),
             }
         )
@@ -998,6 +1117,23 @@ class IntradayStockScanner:
 
     def _display_symbol(self, symbol: str) -> str:
         return symbol.removesuffix(".NS")
+
+    def _check_scanner_health(self) -> None:
+        if not self.last_scan_time:
+            return
+        now = datetime.now(IST)
+        last_scan = datetime.fromisoformat(self.last_scan_time).astimezone(IST)
+        if (now - last_scan) <= timedelta(minutes=10):
+            return
+        if self.last_health_warning_time and (now - self.last_health_warning_time) < timedelta(minutes=5):
+            return
+        message = (
+            "Scanner Health Warning\n\n"
+            f"Last successful scan: {last_scan.strftime('%Y-%m-%d %H:%M:%S IST')}\n"
+            "The scanner may have stopped or stalled."
+        )
+        self._send_telegram_alert(message)
+        self.last_health_warning_time = now
 
 
 def load_config(path: Path) -> ScannerConfig:
@@ -1110,6 +1246,7 @@ def scanner_loop() -> None:
 
     scanner.run_once()
     schedule.every(config.refresh_interval_seconds).seconds.do(scanner.run_once)
+    schedule.every(5).minutes.do(scanner._check_scanner_health)
 
     logger.info("Scanner thread started. Refresh interval %s seconds", config.refresh_interval_seconds)
     print(f"Scanner is running. Refresh interval: {config.refresh_interval_seconds} seconds")
@@ -1141,10 +1278,28 @@ def healthcheck() -> str:
 def dashboard() -> Response:
     scanner = scanner_instance
     alerts = list(scanner.recent_alerts)[:20] if scanner else []
+    top_alerts = sorted(alerts, key=lambda alert: float(alert["priority"]), reverse=True)[:5]
     last_scan = "N/A"
     if scanner and scanner.last_scan_time:
         last_scan = datetime.fromisoformat(scanner.last_scan_time).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     watchlist = ", ".join(scanner._display_symbol(symbol) for symbol in scanner.daily_watchlist) if scanner and scanner.daily_watchlist else "N/A"
+    scanner_running = bool(scanner_thread and scanner_thread.is_alive())
+    total_alerts_today = scanner.total_alerts_generated if scanner else 0
+    watchlist_size = len(scanner.daily_watchlist) if scanner else 0
+    top_rows = "".join(
+        (
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td>{alert['symbol']}</td>"
+            f"<td>{alert['action']}</td>"
+            f"<td>{alert['score']}</td>"
+            f"<td>{alert['priority']:.2f}</td>"
+            f"<td>{alert['confluence']}</td>"
+            f"<td>{alert['confidence']}</td>"
+            "</tr>"
+        )
+        for index, alert in enumerate(top_alerts, start=1)
+    )
     rows = "".join(
         (
             "<tr>"
@@ -1156,6 +1311,7 @@ def dashboard() -> Response:
             f"<td>{alert['priority']:.2f}</td>"
             f"<td>{alert['confluence']}</td>"
             f"<td>{alert['confidence']}</td>"
+            f"<td>{alert['range_potential']}</td>"
             f"<td>{alert['signals']}</td>"
             "</tr>"
         )
@@ -1164,14 +1320,40 @@ def dashboard() -> Response:
     html = (
         "<html><head><title>Scanner Dashboard</title>"
         "<meta http-equiv='refresh' content='30'>"
-        "<style>body{font-family:Arial,sans-serif;padding:20px;}table{border-collapse:collapse;width:100%;}"
-        "th,td{border:1px solid #ccc;padding:8px;text-align:left;}th{background:#f4f4f4;}</style>"
-        "</head><body><h1>Intraday Stock Scanner Dashboard</h1>"
-        f"<p><strong>Last Scan:</strong> {last_scan}</p>"
-        f"<p><strong>Today's Watchlist:</strong> {watchlist}</p>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;background:#f5f7fb;margin:0;padding:24px;color:#1f2937;}"
+        ".container{max-width:1200px;margin:0 auto;}"
+        "h1{margin-bottom:20px;text-align:center;}"
+        ".section-title{font-size:20px;margin:0 0 12px 0;}"
+        ".card{background:#fff;border:1px solid #dbe3ef;border-radius:12px;padding:18px 20px;margin-bottom:18px;"
+        "box-shadow:0 4px 14px rgba(15,23,42,0.05);}"
+        ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;}"
+        ".stat{background:#f8fafc;border-radius:10px;padding:12px 14px;}"
+        ".label{font-size:12px;text-transform:uppercase;color:#64748b;letter-spacing:.04em;}"
+        ".value{font-size:18px;font-weight:700;margin-top:4px;}"
+        ".watchlist{line-height:1.7;}"
+        "table{border-collapse:collapse;width:100%;margin-top:8px;}"
+        "th,td{border:1px solid #dbe3ef;padding:10px 12px;text-align:left;vertical-align:top;}"
+        "th{background:#eef4fb;}"
+        "</style>"
+        "</head><body><div class='container'><h1>Intraday Stock Scanner Dashboard</h1>"
+        "<div class='card'><div class='section-title'>Scanner Status</div>"
+        "<div class='stats'>"
+        f"<div class='stat'><div class='label'>Scanner Running</div><div class='value'>{scanner_running}</div></div>"
+        f"<div class='stat'><div class='label'>Last Scan Time</div><div class='value'>{last_scan}</div></div>"
+        f"<div class='stat'><div class='label'>Total Alerts Today</div><div class='value'>{total_alerts_today}</div></div>"
+        f"<div class='stat'><div class='label'>Watchlist Size</div><div class='value'>{watchlist_size}</div></div>"
+        "</div></div>"
+        "<div class='card'><div class='section-title'>Today's Watchlist</div>"
+        f"<div class='watchlist'>{watchlist}</div></div>"
+        "<div class='card'><div class='section-title'>Top 5 Trade Opportunities</div>"
+        "<table><thead><tr><th>Rank</th><th>Symbol</th><th>Action</th><th>Score</th><th>Priority</th>"
+        "<th>Confluence</th><th>Confidence</th></tr></thead>"
+        f"<tbody>{top_rows}</tbody></table></div>"
+        "<div class='card'><div class='section-title'>Recent Alerts</div>"
         "<table><thead><tr><th>Time</th><th>Symbol</th><th>Price</th><th>Action</th><th>Score</th>"
-        "<th>Priority</th><th>Confluence</th><th>Confidence</th><th>Signals</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table></body></html>"
+        "<th>Priority</th><th>Confluence</th><th>Confidence</th><th>Range Potential</th><th>Signals</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div></div></body></html>"
     )
     return Response(html, mimetype="text/html")
 
